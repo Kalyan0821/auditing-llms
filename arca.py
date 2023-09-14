@@ -5,75 +5,115 @@ import torch.nn.functional as F
 from losses import log_prob_loss, log_perplexity
 from utils import get_forbidden_toks, filter_forbidden_toks, get_unigram_probs 
 
-def run_arca(args, model, tokenizer, embedding_table, output_str = None):
-    # Fixed output is used in the reverse case
-    fixed_output = output_str is not None
+
+def run_arca(args, model, tokenizer, embedding_table, output_str=None):
+    # (Fixed output is used in the reverse case)
+    fixed_output = (output_str is not None)
     run_metadata = {}
     args.batch_size = args.arca_batch_size
-    embedding_dim = embedding_table.shape[1]
-    # Avoid degenerate solutions + additional constraints specified in args
-    forbidden_input_toks = get_forbidden_toks(args, tokenizer, n_total_toks = embedding_table.shape[0], 
-            output = False, output_str = output_str)
+    embedding_dim = embedding_table.shape[1]  # d (V x d)
+    
+    # (Avoid degenerate solutions + additional constraints specified in args)
+    forbidden_input_toks = get_forbidden_toks(args, 
+                                              tokenizer, 
+                                              n_total_toks=embedding_table.shape[0],  # V
+                                              output=False, 
+                                              output_str=output_str)  # list of tokens to avoid in x
+    
     if not fixed_output:
-        forbidden_output_toks = get_forbidden_toks(args, tokenizer, n_total_toks = embedding_table.shape[0], 
-                output = True, output_str = output_str)
-    # Whether or not to use a fixed prompt prefix
+        forbidden_output_toks = get_forbidden_toks(args, 
+                                                   tokenizer, 
+                                                   n_total_toks=embedding_table.shape[0], 
+                                                   output=True, 
+                                                   output_str=output_str)  # empty set
+        
+    # (Whether or not to use a fixed prompt prefix)
     use_pp = args.prompt_prefix is not None
     if use_pp:
-        prefix_toks = torch.Tensor(tokenizer(args.prompt_prefix)['input_ids']).long().to(args.device)
-        prefix_embeddings = embedding_table[prefix_toks].unsqueeze(0)
-        prefix_embeddings = prefix_embeddings.repeat(args.batch_size, 1, 1).detach()
-        prefix_length = prefix_embeddings.shape[1]
+        prefix_toks = torch.Tensor(tokenizer(args.prompt_prefix)['input_ids']
+                                   ).long().to(args.device)  # L_prefix
+        prefix_embeddings = embedding_table[prefix_toks].unsqueeze(0)  # 1 x L_prefix x d
+        prefix_embeddings = prefix_embeddings.repeat(args.batch_size, 1, 1).detach()  # B x L_prefix x d
+        prefix_length = prefix_embeddings.shape[1]  # L_prefix
 
-    vocab_size = embedding_table.shape[0]
-    embedding_dim = embedding_table.shape[1]
-    if fixed_output:
-        output_toks = np.array(tokenizer(output_str)['input_ids'])
-        output_toks_tensor = torch.Tensor(tokenizer(output_str)['input_ids']).long().to('cuda')
-        args.output_length = output_toks.shape[0]
+    vocab_size = embedding_table.shape[0]  # V
+    embedding_dim = embedding_table.shape[1]  # d
+
+    if fixed_output:  # True for reversal
+        output_toks = np.array(tokenizer(output_str)['input_ids']
+                              )  # L_output
+        # output_toks_tensor = torch.Tensor(tokenizer(output_str)['input_ids']
+        #                                   ).long().to(args.device)  # L_output
+        args.output_length = output_toks.shape[0]  # L_output
         run_metadata['n_output_toks'] = args.output_length
         assert args.unigram_output_constraint is None
 
-    curr_toks = np.random.choice(vocab_size, size = args.prompt_length + args.output_length, replace = True)
-    if fixed_output:
+    curr_toks = np.random.choice(vocab_size, 
+                                 size=args.prompt_length + args.output_length,
+                                 replace=True)  # L_attack + L_output
+    
+    if fixed_output:  # True for reversal
         curr_toks[args.prompt_length:] = output_toks
     if use_pp:
-        curr_toks = np.concatenate([prefix_toks.detach().cpu().numpy(), curr_toks], axis = 0)
-    stacked_cur_toks = np.tile(curr_toks, (args.batch_size, 1))
-    curr_toks_tensor = torch.Tensor(stacked_cur_toks).long().to(args.device)
-    
-    if args.unigram_output_constraint is not None:
-        output_unigram_lps = get_unigram_probs(args.unigram_output_constraint, gptj = args.model_id == 'gptj')
-    if args.unigram_input_constraint is not None:
-        input_unigram_lps = get_unigram_probs(args.unigram_input_constraint, gptj = args.model_id == 'gptj')
+        curr_toks = np.concatenate([prefix_toks.detach().cpu().numpy(), curr_toks], axis=0)  # L_prefix + L_attack + L_output
 
-    output_start = args.prompt_length + prefix_length if use_pp else args.prompt_length
-    full_embeddings = torch.zeros(args.batch_size, args.prompt_length + args.output_length, embedding_dim).to('cuda')
-    # Initialize full embeddings
+    stacked_cur_toks = np.tile(curr_toks, (args.batch_size, 1))  # B x (L_prefix + L_attack + L_output)
+    curr_toks_tensor = torch.Tensor(stacked_cur_toks).long().to(args.device)
+
+
+    if args.unigram_output_constraint is not None:  # "toxic" for joint optimization
+        output_unigram_lps = get_unigram_probs(args.unigram_output_constraint, 
+                                               device=args.device, 
+                                               gptj=(args.model_id == 'gptj'))  # V x 6, unigram probs that words are (toxic, etc.)
+    if args.unigram_input_constraint is not None:  # "not_toxic" for joint optimization
+        input_unigram_lps = get_unigram_probs(args.unigram_input_constraint, 
+                                              device=args.device, 
+                                              gptj=(args.model_id == 'gptj'))  # V x 6, unigram probs that words are NOT (toxic, etc.)
+
+    output_start = args.prompt_length + prefix_length if use_pp else args.prompt_length  # (L_prefix + L_attack) or (L_attack)
+
+    # (Initialize full embeddings)
+    full_embeddings = torch.zeros(args.batch_size, 
+                                  args.prompt_length + args.output_length, 
+                                  embedding_dim).to(args.device)  # B x (L_attack + L_output) x d
     for i in range(args.prompt_length + args.output_length):
-        rel_idx = i + prefix_length if use_pp else i
-        full_embeddings[:, i] = embedding_table[curr_toks[rel_idx]].unsqueeze(0).repeat(args.batch_size, 1)
-    # Iterate
-    for it in tqdm(range(args.arca_iters)):
-        for tok_id in range(args.prompt_length + args.output_length):
-            tok_in_output = tok_id >= args.prompt_length
-            # Output tokens remain fixed in the reversing case
+        rel_idx = i + prefix_length if use_pp else i  # (L_prefix + i)
+        full_embeddings[:, i] = embedding_table[curr_toks[rel_idx]].unsqueeze(0  # 1 x d
+                                                                              ).repeat(args.batch_size, 1)  # B x d
+        
+    # (Iterate)
+    for it in tqdm(range(args.arca_iters)):  # number of iters to optimize entire attack
+
+        for tok_idx in range(args.prompt_length + args.output_length):  # cycle through positions: L_attack + L_output
+            tok_in_output = (tok_idx >= args.prompt_length)
+            # (Output tokens remain fixed in the reversing case)
             if tok_in_output and fixed_output:
                 continue
-            update_idx = tok_id + prefix_length if use_pp else tok_id
-            new_indices = np.random.choice(vocab_size, size = args.batch_size, replace = True)
+
+            update_idx = tok_idx + prefix_length if use_pp else tok_idx  # (L_prefix + tok_idx)
+
+
+
+
+
+
+            new_vocab_indices = np.random.choice(vocab_size, 
+                                           size=args.batch_size, 
+                                           replace=True)  # V, 
             if args.autoprompt:
-                new_indices = curr_toks[update_idx].repeat(args.batch_size)
-            full_embeddings[:, tok_id, :] = embedding_table[new_indices, :] 
+                new_vocab_indices = curr_toks[update_idx].repeat(args.batch_size)
+
+            full_embeddings[:, tok_idx, :] = embedding_table[new_vocab_indices, :] 
             if args.model_id == 'gptj':
                 full_embeddings = full_embeddings.half()
+
             # Update to compute the perplexity loss
-            stacked_cur_toks[:, update_idx] = new_indices
-            curr_toks_tensor[:, update_idx] = torch.Tensor(new_indices).long().to('cuda')
+            stacked_cur_toks[:, update_idx] = new_vocab_indices
+            curr_toks_tensor[:, update_idx] = torch.Tensor(new_vocab_indices).long().to(args.device)
             if use_pp:
-                labels = torch.cat([-100 * torch.ones(args.prompt_length + prefix_length).to('cuda').unsqueeze(0).repeat(args.batch_size, 1), curr_toks_tensor[:, args.prompt_length + prefix_length:]], dim = 1).long()
+                labels = torch.cat([-100 * torch.ones(args.prompt_length + prefix_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1), curr_toks_tensor[:, args.prompt_length + prefix_length:]], dim = 1).long()
             else:
-                labels = torch.cat([-100 * torch.ones(args.prompt_length).to('cuda').unsqueeze(0).repeat(args.batch_size, 1), curr_toks_tensor[:, args.prompt_length:]], dim = 1).long()
+                labels = torch.cat([-100 * torch.ones(args.prompt_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1), curr_toks_tensor[:, args.prompt_length:]], dim = 1).long()
             full_embeddings = full_embeddings.detach()
             if full_embeddings.requires_grad:
                 full_embeddings.grad.zero_()
@@ -90,7 +130,7 @@ def run_arca(args, model, tokenizer, embedding_table, output_str = None):
                 loss += args.lam_perp * perp_loss
             loss.backward(retain_graph = True)
             grad = full_embeddings.grad
-            backward_scores = - torch.matmul(embedding_table, grad[:,tok_id,:].mean(dim = 0))
+            backward_scores = - torch.matmul(embedding_table, grad[:,tok_idx,:].mean(dim = 0))
             if tok_in_output and not args.autoprompt:
                 forward_log_probs = F.log_softmax(out.logits[0, update_idx - 1, :], dim = 0)
                 scores = backward_scores + forward_log_probs
@@ -107,10 +147,11 @@ def run_arca(args, model, tokenizer, embedding_table, output_str = None):
             else:
                 best_scores_idxs = filter_forbidden_toks(best_scores_idxs, forbidden_input_toks)
             full_embeddings= full_embeddings.detach()
+
             with torch.no_grad():
-                full_embeddings[:, tok_id, :] = embedding_table[best_scores_idxs[:args.batch_size], :]                
+                full_embeddings[:, tok_idx, :] = embedding_table[best_scores_idxs[:args.batch_size], :]                
                 stacked_cur_toks[:, update_idx] = best_scores_idxs[:args.batch_size].cpu().detach().numpy()
-                curr_toks_tensor[:, tok_id] = best_scores_idxs[:args.batch_size]
+                curr_toks_tensor[:, tok_idx] = best_scores_idxs[:args.batch_size]
                 if use_pp:
                     out = model(inputs_embeds = torch.cat([prefix_embeddings, full_embeddings], dim = 1))
                 else:
@@ -129,7 +170,7 @@ def run_arca(args, model, tokenizer, embedding_table, output_str = None):
                 curr_toks[update_idx] = best_idx.item()
                 stacked_cur_toks[:, update_idx] = best_idx.item()
                 curr_toks_tensor[:, update_idx] = best_idx.item()
-                full_embeddings[:, tok_id, :] = embedding_table[best_idx].unsqueeze(0).repeat(args.batch_size, 1)
+                full_embeddings[:, tok_idx, :] = embedding_table[best_idx].unsqueeze(0).repeat(args.batch_size, 1)
                 gen_output = log_probs[best_batch_idx].argmax(dim = 1)
                 actual_output = curr_toks_tensor[0][output_start:]
                 # Can modify success conditions here to stop running the algorithm

@@ -7,33 +7,52 @@ from arca import run_arca
 from gbda import run_gbda
 from model_utils import get_raw_embedding_table, get_model_and_tokenizer
 
-ATTACKS_DICT = {'arca': run_arca, 'autoprompt': run_arca, 'gbda': run_gbda}
+ATTACKS_DICT = {'arca': run_arca, 
+                'autoprompt': run_arca,  # AutoPrompt not implemented
+                'gbda': run_gbda}
 
-def run_opts(args, model, tokenizer, embedding_table, infile):
-    output_targets = load_outputs(infile) 
+def run_opts(args, model, tokenizer, 
+             embedding_table,  # V x d
+             infile):
+    
+    output_targets = load_outputs(infile)  # list of senator names (100)
     if args.max_num_examples is not None:
         output_targets = output_targets[:args.max_num_examples]
+
     output_filename = get_output_file(infile, output_dir = 'reverse_outputs')
+
     results_dicts = []
-    for i, output_target in tqdm(enumerate(output_targets), total = len(output_targets)):
+    for i, output_target in tqdm(enumerate(output_targets), total=len(output_targets)):  # loop through target strs (examples)
         results_dict = {}
-        results_dict['output_target'] = output_target
-        for attack_name in args.opts_to_run:
+        results_dict['output_target'] = output_target  # senator name
+
+        for attack_name in args.opts_to_run:  # some subset of ["arca", "autoprompt", "gbda"]
             assert attack_name in ATTACKS_DICT
             if attack_name == 'arca':
-                args.autoprompt = False
+                args.autoprompt = False  # ?????????????????
             elif attack_name == 'autoprompt':
                 args.autoprompt = True
+
             prompts = []
             n_iters = []
             attack_times = []
             all_prompt_toks = []
             metadata = defaultdict(list)
             successes = 0
-            for trial in range(args.n_trials):
+            
+            for _ in range(args.n_trials):  # number of times to try attacking each example
                 attack_fn = ATTACKS_DICT[attack_name]
                 start = datetime.now()
+
+
+
+
+
+
+
+                # run_arca(...) or run_gbda(...)
                 prompt_toks, n_iter, run_metadata = attack_fn(args, model, tokenizer, embedding_table, output_str = output_target)
+                
                 if n_iter == -1:
                     prompt = None
                 else:
@@ -46,6 +65,7 @@ def run_opts(args, model, tokenizer, embedding_table, infile):
                 attack_times.append((datetime.now() - start).seconds)
                 for key in run_metadata:
                     metadata[key].append(run_metadata[key])
+
             # Log results 
             results_dict[f'{attack_name}'] = {}
             results_dict[f'{attack_name}']['prompts'] = prompts
@@ -67,6 +87,9 @@ def run_opts(args, model, tokenizer, embedding_table, infile):
 if __name__ == '__main__':
     args = parse_args()
     model, tokenizer = get_model_and_tokenizer(args)
-    embedding_table = get_raw_embedding_table(model)
+    embedding_table = get_raw_embedding_table(model)  # (V x d) = (50257 x 6) for GPT2
+
+    print(embedding_table.shape)
+
     infile = f'data/{args.filename}'
     run_opts(args, model, tokenizer, embedding_table, infile)
