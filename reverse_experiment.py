@@ -8,7 +8,7 @@ from gbda import run_gbda
 from model_utils import get_raw_embedding_table, get_model_and_tokenizer
 
 ATTACKS_DICT = {'arca': run_arca, 
-                'autoprompt': run_arca,  # AutoPrompt not implemented
+                'autoprompt': run_arca,  # AutoPrompt implemented in run_arca
                 'gbda': run_gbda}
 
 def run_opts(args, model, tokenizer, 
@@ -88,8 +88,7 @@ if __name__ == '__main__':
     args = parse_args()
     model, tokenizer = get_model_and_tokenizer(args)
     embedding_table = get_raw_embedding_table(model)  # (V x d) = (50257 x 6) for GPT2
-
-    print(embedding_table.shape)
+    # print(embedding_table.shape)
 
     infile = f'data/{args.filename}'
     run_opts(args, model, tokenizer, embedding_table, infile)

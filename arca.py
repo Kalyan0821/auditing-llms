@@ -28,8 +28,8 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                                                    output_str=output_str)  # empty set
         
     # (Whether or not to use a fixed prompt prefix)
-    use_pp = args.prompt_prefix is not None
-    if use_pp:
+    use_prefix = (args.prompt_prefix is not None)
+    if use_prefix:
         prefix_toks = torch.Tensor(tokenizer(args.prompt_prefix)['input_ids']
                                    ).long().to(args.device)  # L_prefix
         prefix_embeddings = embedding_table[prefix_toks].unsqueeze(0)  # 1 x L_prefix x d
@@ -54,12 +54,11 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
     
     if fixed_output:  # True for reversal
         curr_toks[args.prompt_length:] = output_toks
-    if use_pp:
+    if use_prefix:
         curr_toks = np.concatenate([prefix_toks.detach().cpu().numpy(), curr_toks], axis=0)  # L_prefix + L_attack + L_output
 
     stacked_cur_toks = np.tile(curr_toks, (args.batch_size, 1))  # B x (L_prefix + L_attack + L_output)
     curr_toks_tensor = torch.Tensor(stacked_cur_toks).long().to(args.device)
-
 
     if args.unigram_output_constraint is not None:  # "toxic" for joint optimization
         output_unigram_lps = get_unigram_probs(args.unigram_output_constraint, 
@@ -70,17 +69,17 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                                               device=args.device, 
                                               gptj=(args.model_id == 'gptj'))  # V x 6, unigram probs that words are NOT (toxic, etc.)
 
-    output_start = args.prompt_length + prefix_length if use_pp else args.prompt_length  # (L_prefix + L_attack) or (L_attack)
+    output_start = args.prompt_length + prefix_length if use_prefix else args.prompt_length  # (L_prefix + L_attack) or (L_attack)
 
     # (Initialize full embeddings)
     full_embeddings = torch.zeros(args.batch_size, 
                                   args.prompt_length + args.output_length, 
                                   embedding_dim).to(args.device)  # B x (L_attack + L_output) x d
     for i in range(args.prompt_length + args.output_length):
-        rel_idx = i + prefix_length if use_pp else i  # (L_prefix + i)
-        full_embeddings[:, i] = embedding_table[curr_toks[rel_idx]].unsqueeze(0  # 1 x d
+        rel_idx = (i + prefix_length) if use_prefix else i  # (L_prefix + i)
+        full_embeddings[:, i, :] = embedding_table[curr_toks[rel_idx]].unsqueeze(0  # 1 x d
                                                                               ).repeat(args.batch_size, 1)  # B x d
-        
+
     # (Iterate)
     for it in tqdm(range(args.arca_iters)):  # number of iters to optimize entire attack
 
@@ -90,47 +89,78 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
             if tok_in_output and fixed_output:
                 continue
 
-            update_idx = tok_idx + prefix_length if use_pp else tok_idx  # (L_prefix + tok_idx)
+            update_idx = (tok_idx + prefix_length) if use_prefix else tok_idx  # (L_prefix + tok_idx)
 
-
-
-
-
-
-            new_vocab_indices = np.random.choice(vocab_size, 
+            random_vocab_indices = np.random.choice(vocab_size, 
                                            size=args.batch_size, 
-                                           replace=True)  # V, 
+                                           replace=True)  # to avg gradients over B random tokens (same as K in paper?)            
             if args.autoprompt:
-                new_vocab_indices = curr_toks[update_idx].repeat(args.batch_size)
+                random_vocab_indices = curr_toks[update_idx].repeat(args.batch_size)  # doesn't use random tokens, so just repeat the same one B times
 
-            full_embeddings[:, tok_idx, :] = embedding_table[new_vocab_indices, :] 
+            # redundant if running AutoPrompt since random_vocab_indices is just the current token repeated            
+            full_embeddings[:, tok_idx, :] = embedding_table[random_vocab_indices, :]  # B x d
             if args.model_id == 'gptj':
                 full_embeddings = full_embeddings.half()
 
-            # Update to compute the perplexity loss
-            stacked_cur_toks[:, update_idx] = new_vocab_indices
-            curr_toks_tensor[:, update_idx] = torch.Tensor(new_vocab_indices).long().to(args.device)
-            if use_pp:
-                labels = torch.cat([-100 * torch.ones(args.prompt_length + prefix_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1), curr_toks_tensor[:, args.prompt_length + prefix_length:]], dim = 1).long()
+            # (Update to compute likelihood and perplexity losses)
+            stacked_cur_toks[:, update_idx] = random_vocab_indices  # B, random tokens
+            curr_toks_tensor[:, update_idx] = torch.Tensor(random_vocab_indices).long().to(args.device)
+
+            # for ln p(o|x) loss
+            if use_prefix:
+                labels = torch.cat([-100*torch.ones(args.prompt_length + prefix_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1),  # B x (L_prefix + L_attack), all -100
+                                    curr_toks_tensor[:, args.prompt_length + prefix_length:]  # B x L_output
+                                    ], 
+                                dim=1).long()  # B x (L_prefix + L_attack + L_output)
+                                                 # curr_toks in output positions repeated B times. If tok_idx is an
+                                                 # output position, then just that position is replaced with B random tokens.
             else:
-                labels = torch.cat([-100 * torch.ones(args.prompt_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1), curr_toks_tensor[:, args.prompt_length:]], dim = 1).long()
-            full_embeddings = full_embeddings.detach()
+                labels = torch.cat([-100 * torch.ones(args.prompt_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1),  # B x L_attack, all -100
+                                    curr_toks_tensor[:, args.prompt_length:]
+                                    ], 
+                                dim=1).long()  # B x (L_attack + L_output)
+
+            full_embeddings = full_embeddings.detach()  # requires_grad => False, grad => None
+            # not called!
             if full_embeddings.requires_grad:
                 full_embeddings.grad.zero_()
-            full_embeddings.requires_grad = True
-            full_embeddings.retain_grad()
-            if use_pp:
-                out = model(inputs_embeds = torch.cat([prefix_embeddings, full_embeddings], dim = 1), labels = labels)
+
+            full_embeddings.requires_grad = True  # grad will be populated during backward()
+            full_embeddings.retain_grad()  # grad => still None
+            
+            if use_prefix:
+                out = model(inputs_embeds=torch.cat([prefix_embeddings,  # requires_grad = False
+                                                     full_embeddings],  # requires_grad = True
+                                                dim=1),  # B x (L_prefix + L_attack + L_output) x d
+                            labels=labels  # B x (L_prefix + L_attack + L_output)
+                            )  # CausalLMOutputWithCrossAttentions object
             else:
-                out = model(inputs_embeds = full_embeddings, labels = labels)
-            loss = log_prob_loss(out, labels, temp = 1)
-            # Comptue the perplexity loss
+                out = model(inputs_embeds=full_embeddings,  # B x (L_attack + L_output) x d
+                            labels=labels  # B x (L_attack + L_output) x d
+                            )  # CausalLMOutputWithCrossAttentions object
+                
+            loss = log_prob_loss(out, labels, temp=1)  # scalar (averaged over B and L)
+
+            # (Compute the perplexity loss)
             if args.lam_perp > 0:
-                perp_loss = log_perplexity(out, stacked_cur_toks[:,:output_start])
+                perp_loss = log_perplexity(out, 
+                                           stacked_cur_toks[:, :output_start]  # B x (L_prefix + L_attack)
+                                           )  # scalar (averaged over B and L)
+                                              # ALSO INCLUDES PERPLEXITY OF PREFIX. WHY ???????????????????????????
                 loss += args.lam_perp * perp_loss
-            loss.backward(retain_graph = True)
-            grad = full_embeddings.grad
-            backward_scores = - torch.matmul(embedding_table, grad[:,tok_idx,:].mean(dim = 0))
+            
+            loss.backward(retain_graph=True)  # computes gradients and allows subsequent .backward() calls
+
+            grad = full_embeddings.grad  # B x (L_attack + L_output) x d
+
+
+
+
+            backward_scores = -torch.matmul(embedding_table, grad[:,tok_idx,:].mean(dim = 0))
+            
+
+
+
             if tok_in_output and not args.autoprompt:
                 forward_log_probs = F.log_softmax(out.logits[0, update_idx - 1, :], dim = 0)
                 scores = backward_scores + forward_log_probs
@@ -146,13 +176,13 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                 best_scores_idxs = filter_forbidden_toks(best_scores_idxs, forbidden_output_toks)
             else:
                 best_scores_idxs = filter_forbidden_toks(best_scores_idxs, forbidden_input_toks)
-            full_embeddings= full_embeddings.detach()
+            full_embeddings = full_embeddings.detach()
 
             with torch.no_grad():
                 full_embeddings[:, tok_idx, :] = embedding_table[best_scores_idxs[:args.batch_size], :]                
                 stacked_cur_toks[:, update_idx] = best_scores_idxs[:args.batch_size].cpu().detach().numpy()
                 curr_toks_tensor[:, tok_idx] = best_scores_idxs[:args.batch_size]
-                if use_pp:
+                if use_prefix:
                     out = model(inputs_embeds = torch.cat([prefix_embeddings, full_embeddings], dim = 1))
                 else:
                     out = model(inputs_embeds = full_embeddings)
@@ -170,9 +200,12 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                 curr_toks[update_idx] = best_idx.item()
                 stacked_cur_toks[:, update_idx] = best_idx.item()
                 curr_toks_tensor[:, update_idx] = best_idx.item()
+
                 full_embeddings[:, tok_idx, :] = embedding_table[best_idx].unsqueeze(0).repeat(args.batch_size, 1)
+                
                 gen_output = log_probs[best_batch_idx].argmax(dim = 1)
                 actual_output = curr_toks_tensor[0][output_start:]
+
                 # Can modify success conditions here to stop running the algorithm
                 output_matches = (actual_output == gen_output).all().item()
                 if args.unigram_input_constraint is not None:
@@ -183,6 +216,8 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                     output_unigram_satisfied = torch.exp(output_unigram_lps[curr_toks[output_start:]].max()).item() > 0.5
                 else:
                     output_unigram_satisfied = True
+
+
                 # Success condition
                 if output_matches and input_unigram_satisfied and output_unigram_satisfied:
                     if args.lam_perp > 0:
@@ -198,6 +233,7 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                     if fixed_output:
                         curr_toks = curr_toks[:-args.output_length]
                     return curr_toks, it, run_metadata
+                
     # Failure case
     if args.lam_perp > 0:
         run_metadata['perplexity'] = None

@@ -53,41 +53,87 @@ def to_jsonl(dicts, save_file):
             jsonl_line = f'{json.dumps(line_dict, cls = NpEncoder)}\n'
             f.write(jsonl_line)
 
-def get_unigram_probs(constraint, device = 'cuda', gptj = False):
+
+def get_unigram_probs(constraint,  # 
+                      device='cuda', gptj=False):
     neg_constraint = constraint.startswith('not')
     if neg_constraint:
         constraint = constraint[len('not_'):]
-    # Constraints taken from: https://github.com/unitaryai/detoxifysssssss
-    tox_constraints = ['toxic', 'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
+    # (Constraints taken from: https://github.com/unitaryai/detoxifysssssss)
+    tox_constraints = ['toxic', 
+                       'severe_toxic', 'obscene', 'threat', 'insult', 'identity_hate']
     languages = ['en', 'es', 'fr', 'it', 'de']
+    
     if constraint in tox_constraints:
         with open('extra_files/tox_log_probs.pkl', 'rb') as f:
-            log_probs = pickle.load(f)
+            log_probs = pickle.load(f)  # V x 6
+        # assert log_probs.shape == (50257, 6)
+
         idx = get_idx(constraint, tox_constraints)
         unigram_probs = log_probs[:, idx]
+
     elif constraint in languages:
         with open(f'extra_files/{constraint}_logprobs.pkl', 'rb') as f:
             unigram_probs = pickle.load(f)
     else:
         raise NotImplementedError
+    
     if neg_constraint:
-        unigram_probs = np.log(1 - np.exp(unigram_probs))
+        unigram_probs = np.log(1 - np.exp(unigram_probs))  # V x 6, probabilities that the words are NOT (toxic, etc.)
+    
     if gptj:
         # Rule out the extra tokens
-        unigram_probs = np.concatenate([unigram_probs, -10000 * np.ones(50400 - 50257)], axis = 0)
+        unigram_probs = np.concatenate([unigram_probs, -10000 * np.ones(50400 - 50257)], axis = 0)  # V' x 6
         print("Unigrams prob shape: ", unigram_probs.shape)
+
     return torch.Tensor(unigram_probs).to(device)
 
 
-def get_forbidden_toks(args, tokenizer, n_total_toks = 50257, output = False, output_str = None):
-    constraint = args.inpt_tok_constraint if not output else args.output_tok_constraint
+def toks_to_skip(output_toks, 
+                 tokenizer, 
+                 n_total_toks=50257):
+    toks_to_skip = []
+    if isinstance(output_toks, torch.Tensor):
+        output_toks = output_toks.detach().cpu().numpy()
+      
+    all_toks = [tokenizer.decode([i]) for i in range(n_total_toks)]  # V, decoded
+    output_tok_strs = [all_toks[i] for i in output_toks]  # L_out, decoded
+
+    for i, tok in enumerate(all_toks):  # V
+        if (len(tok) <= 3) and (tok not in output_tok_strs):  # small tokens that are not in o are allowed in x
+            continue
+
+        # (token is fair-game to elimate)
+        # look at (large tokens in o)/(large tokens not in o)/(small tokens in o)
+        for otok in output_tok_strs:
+            otok = otok.strip(' ').lower()
+            tok = tok.strip(' ').lower()
+            # (Asymmetric case: remove one letter off of the target tok, but not the output tok...)
+            if tok.startswith(otok[:-1]) or otok.startswith(tok):  # i.e., discard tok if it (i) starts with all but the last char in otok
+                                                                   #                      or (ii) is entirely contained in beginning of otok
+                toks_to_skip.append(i)
+
+    return np.array(toks_to_skip)
+
+
+def get_forbidden_toks(args, 
+                       tokenizer, 
+                       n_total_toks=50257,  # V
+                       output=False, 
+                       output_str=None  # given for reverse experiments
+                       ):
+    constraint = args.inpt_tok_constraint if not output else args.output_tok_constraint  # None
     if constraint is None:
         if not output and output_str is not None:
-            return toks_to_skip(tokenizer(output_str)['input_ids'], tokenizer, n_total_toks)
+            # want (x, o) to not have significant overlap between any 2 tokens, to avoid trivial solutions x
+            return toks_to_skip(tokenizer(output_str)['input_ids'], 
+                                tokenizer, 
+                                n_total_toks)
         else:
             return set()
-    top_k = args.top_k_input if not output else args.top_k_output
-    #constraints of the form not_toxic
+
+    top_k = args.top_k_input if not output else args.top_k_output  # 0
+    # (constraints of the form not_toxic)
     neg_constraint = constraint.startswith('not')
     if neg_constraint:
         constraint = constraint[len('not_'):]
@@ -130,10 +176,13 @@ def get_forbidden_toks(args, tokenizer, n_total_toks = 50257, output = False, ou
             constraint_toks = pickle.load(f)
     else:
         raise NotImplementedError
+    
     if top_k != 0:
         constraint_toks = constraint_toks[:top_k]
+    
     if not neg_constraint:
         constraint_toks = filter_forbidden_toks(np.arange(n_total_toks), constraint_toks)
+
     if not output and output_str is not None:
         deg_constraint_toks = toks_to_skip(tokenizer(output_str)['input_ids'], tokenizer, n_total_toks)
         # Fine to have duplicates, since this gets passed into filter_forbidden_toks
@@ -141,6 +190,7 @@ def get_forbidden_toks(args, tokenizer, n_total_toks = 50257, output = False, ou
         print("Adding output toks!")
         assert False
     return constraint_toks
+
 
 def filter_forbidden_toks(toks_tensor, forbidden_toks):
     if len(forbidden_toks) == 0:
@@ -155,21 +205,3 @@ def filter_forbidden_toks(toks_tensor, forbidden_toks):
         elements_ok = np.where(mask[toks_tensor] == 0)[0]
     toks_tensor = toks_tensor[elements_ok]
     return toks_tensor
-
-def toks_to_skip(output_toks, tokenizer, n_total_toks = 50257):
-    toks_to_skip = []
-    if isinstance(output_toks, torch.Tensor):
-        output_toks = output_toks.detach().cpu().numpy()
-    all_toks = [tokenizer.decode([i]) for i in range(n_total_toks)]
-    output_tok_strs = [all_toks[i] for i in output_toks]
-    for i, tok in enumerate(all_toks):
-        if len(tok) <= 3 and tok not in output_tok_strs:
-            continue
-        # token is fair-game to elimate
-        for otok in output_tok_strs:
-            otok = otok.strip(' ').lower()
-            tok = tok.strip(' ').lower()
-            # Asymmetric case: remove one letter off of the target tok, but not the output tok...
-            if tok.startswith(otok[:-1]) or otok.startswith(tok):
-                toks_to_skip.append(i)
-    return np.array(toks_to_skip)

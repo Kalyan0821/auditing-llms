@@ -29,7 +29,7 @@ def parse_args(joint = False):
     parser.add_argument('--max_num_examples', type = int, default = None,
             help = 'Maximum number of examples to run through')
     parser.add_argument('--autoprompt', action = 'store_true',
-            help = 'Compute gradients at current token')
+            help = 'Compute gradients at current token')  # instead of averaging over random ones
     parser.add_argument('--inpt_tok_constraint', type = str, default = None,
             help = 'Constraint on the set of allowable input tokens')
     parser.add_argument('--output_tok_constraint', type = str, default = None,
