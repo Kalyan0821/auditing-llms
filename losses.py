@@ -6,7 +6,7 @@ import torch.nn.functional as F
 def log_prob_loss(output, labels, temp=1):
     """ labels: B x (L_prefix + L_attack + L_output)
         The first B x (L_prefix + L_attack) are all -100.
-        curr_toks in output positions repeated B times. If tok_idx is an output position, then just that position is replaced with B random tokens. """
+        curr_toks in output positions repeated B times. """
 
     logits = output.logits  # B x (L_prefix + L_attack + L_output) x V
     if torch.isnan(logits).any():
@@ -34,14 +34,14 @@ def log_perplexity(output, prompts, ret_all=False):
     shift_prompts = prompts[:, 1:]  # B x (L_prefix + L_attack - 1)
                                     # all but the first token needs to be predicted
     L = shift_prompts.shape[1]  # (L_prefix + L_attack - 1)
-
     shift_logits = output.logits[:, :L, :]  # B x (L_prefix + L_attack - 1) x V 
+    V = shift_logits.shape[-1]
+
+    # Can do this or the stuff after the return    
     log_probs = F.log_softmax(shift_logits, dim=2)  # B x (L_prefix + L_attack - 1) x V
     B = log_probs.shape[0]
     assert L == log_probs.shape[1]
-    V = log_probs.shape[2]
-
-    # Can do this or the stuff after the return    
+    assert V == log_probs.shape[2]
     stacked_perplexities = torch.stack(
                                 [log_probs[i, torch.arange(L), shift_prompts[i]].mean()  # mean cross entropy loss over (L_prefix + L_attack - 1) positions 
                                     for i in range(B)])

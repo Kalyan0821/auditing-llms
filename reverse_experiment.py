@@ -22,7 +22,8 @@ def run_opts(args, model, tokenizer,
     output_filename = get_output_file(infile, output_dir = 'reverse_outputs')
 
     results_dicts = []
-    for i, output_target in tqdm(enumerate(output_targets), total=len(output_targets)):  # loop through target strs (examples)
+    print()
+    for i, output_target in enumerate(output_targets):  # loop through target strs (examples)
         results_dict = {}
         results_dict['output_target'] = output_target  # senator name
 
@@ -40,16 +41,14 @@ def run_opts(args, model, tokenizer,
             metadata = defaultdict(list)
             successes = 0
             
-            for _ in range(args.n_trials):  # number of times to try attacking each example
+            print(f"Target: {output_target}")
+            print(f"Attack name: {attack_name}")
+
+            for trial in range(args.n_trials):  # number of times to try attacking each example
                 attack_fn = ATTACKS_DICT[attack_name]
                 start = datetime.now()
 
-
-
-
-
-
-
+                print("Trial:", trial+1)
                 # run_arca(...) or run_gbda(...)
                 prompt_toks, n_iter, run_metadata = attack_fn(args, model, tokenizer, embedding_table, output_str = output_target)
                 
@@ -59,12 +58,19 @@ def run_opts(args, model, tokenizer,
                     prompt = tokenizer.decode(prompt_toks)
                     prompt_toks = list(prompt_toks)
                     successes += 1
+
                 prompts.append(prompt)
                 all_prompt_toks.append(prompt_toks)
                 n_iters.append(n_iter)
                 attack_times.append((datetime.now() - start).seconds)
                 for key in run_metadata:
                     metadata[key].append(run_metadata[key])
+
+                # MINE
+                if n_iter != -1:
+                    break
+
+            print("-----------------------------------------")
 
             # Log results 
             results_dict[f'{attack_name}'] = {}
@@ -75,6 +81,7 @@ def run_opts(args, model, tokenizer,
             results_dict[f'{attack_name}']['success_rate'] = successes / args.n_trials
             for key in metadata:
                 results_dict[f'{attack_name}'][key] = metadata[key]
+
         results_dicts.append(results_dict)
         if (i + 1) % args.save_every == 0:
             print("Saving...")

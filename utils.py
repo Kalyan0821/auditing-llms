@@ -70,7 +70,7 @@ def get_unigram_probs(constraint,  #
         # assert log_probs.shape == (50257, 6)
 
         idx = get_idx(constraint, tox_constraints)
-        unigram_probs = log_probs[:, idx]
+        unigram_probs = log_probs[:, idx]  # V, probabilities that the words are (toxic/...)
 
     elif constraint in languages:
         with open(f'extra_files/{constraint}_logprobs.pkl', 'rb') as f:
@@ -79,11 +79,11 @@ def get_unigram_probs(constraint,  #
         raise NotImplementedError
     
     if neg_constraint:
-        unigram_probs = np.log(1 - np.exp(unigram_probs))  # V x 6, probabilities that the words are NOT (toxic, etc.)
+        unigram_probs = np.log(1 - np.exp(unigram_probs))  # V, probabilities that the words are NOT (toxic/...)
     
     if gptj:
         # Rule out the extra tokens
-        unigram_probs = np.concatenate([unigram_probs, -10000 * np.ones(50400 - 50257)], axis = 0)  # V' x 6
+        unigram_probs = np.concatenate([unigram_probs, -10000 * np.ones(50400 - 50257)], axis=0)  # V'
         print("Unigrams prob shape: ", unigram_probs.shape)
 
     return torch.Tensor(unigram_probs).to(device)
@@ -192,16 +192,21 @@ def get_forbidden_toks(args,
     return constraint_toks
 
 
-def filter_forbidden_toks(toks_tensor, forbidden_toks):
+def filter_forbidden_toks(toks_tensor,  # V
+                          forbidden_toks  # list
+                          ):
     if len(forbidden_toks) == 0:
         return toks_tensor
-    # Toks tensor has all tokens included
-    mask = np.zeros(toks_tensor.shape[0])
-    # Should try to get the indices where bad things happen...
+    
+    # (Toks tensor has all tokens included)
+    mask = np.zeros(toks_tensor.shape[0])  # V
+    # (Should try to get the indices where bad things happen...)
     mask[forbidden_toks] = 1
+
     if isinstance(toks_tensor, torch.Tensor):
         elements_ok = np.where(mask[toks_tensor.detach().cpu().numpy()] == 0)[0]
     else:
         elements_ok = np.where(mask[toks_tensor] == 0)[0]
+
     toks_tensor = toks_tensor[elements_ok]
     return toks_tensor
