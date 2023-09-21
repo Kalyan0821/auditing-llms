@@ -13,7 +13,9 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
     fixed_output = (output_str is not None)
     run_metadata = {}
     args.batch_size = args.arca_batch_size
-    embedding_dim = embedding_table.shape[1]  # d (V x d)
+
+    vocab_size = embedding_table.shape[0]  # V
+    embedding_dim = embedding_table.shape[1]  # d
     
     # (Avoid degenerate solutions + additional constraints specified in args)
     forbidden_input_toks = get_forbidden_toks(args, 
@@ -38,14 +40,9 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
         prefix_embeddings = prefix_embeddings.repeat(args.batch_size, 1, 1).detach()  # B x L_prefix x d
         prefix_length = prefix_embeddings.shape[1]  # L_prefix
 
-    vocab_size = embedding_table.shape[0]  # V
-    embedding_dim = embedding_table.shape[1]  # d
-
     if fixed_output:  # True for reversal
         output_toks = np.array(tokenizer(output_str)['input_ids']
                               )  # L_output
-        # output_toks_tensor = torch.Tensor(tokenizer(output_str)['input_ids']
-        #                                   ).long().to(args.device)  # L_output
         args.output_length = output_toks.shape[0]  # L_output
         run_metadata['n_output_toks'] = args.output_length
         assert args.unigram_output_constraint is None
@@ -58,8 +55,8 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
     if use_prefix:
         curr_toks = np.concatenate([prefix_toks.detach().cpu().numpy(), curr_toks], axis=0)  # L_prefix + L_attack + L_output
 
-    stacked_cur_toks = np.tile(curr_toks, (args.batch_size, 1))  # B x (L_prefix + L_attack + L_output)
-    curr_toks_tensor = torch.Tensor(stacked_cur_toks).long().to(args.device)
+    stacked_curr_toks = np.tile(curr_toks, (args.batch_size, 1))  # B x (L_prefix + L_attack + L_output)
+    stacked_curr_toks = torch.Tensor(stacked_curr_toks).long().to(args.device)
 
     if args.unigram_output_constraint is not None:  # "toxic" for joint optimization
         output_unigram_lps = get_unigram_probs(args.unigram_output_constraint, 
@@ -74,10 +71,7 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
     output_start = args.prompt_length + prefix_length if use_prefix else args.prompt_length  # (L_prefix + L_attack) or (L_attack)
 
     # MINE
-    if use_prefix:
-        L_prefix = prefix_length
-    else:
-        L_prefix = 0      
+    L_prefix = prefix_length if use_prefix else 0
     L_attack = args.prompt_length
     L_out = args.output_length
 
@@ -119,19 +113,19 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                 full_embeddings = full_embeddings.half()
 
             # # NOT REQUIRED, no need to populate targets/labels with the random tokens as well
-            # stacked_cur_toks[:, update_idx] = random_vocab_indices  # B, random tokens
-            # curr_toks_tensor[:, update_idx] = torch.Tensor(random_vocab_indices).long().to(args.device)
+            # stacked_curr_toks[:, update_idx] = random_vocab_indices  # B, random tokens
+            # stacked_curr_toks[:, update_idx] = torch.Tensor(random_vocab_indices).long().to(args.device)  # B, random tokens
 
             # Losses
             if use_prefix:
                 labels = torch.cat([-100*torch.ones(args.prompt_length + prefix_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1),  # B x (L_prefix + L_attack), all -100
-                                    curr_toks_tensor[:, args.prompt_length + prefix_length:]  # B x L_output
+                                    stacked_curr_toks[:, args.prompt_length + prefix_length:]  # B x L_output
                                     ], 
                                 dim=1).long()  # B x (L_prefix + L_attack + L_output)
                                                # @ output positions, curr_toks is repeated B times.
             else:
                 labels = torch.cat([-100 * torch.ones(args.prompt_length).to(args.device).unsqueeze(0).repeat(args.batch_size, 1),  # B x L_attack, all -100
-                                    curr_toks_tensor[:, args.prompt_length:]
+                                    stacked_curr_toks[:, args.prompt_length:]
                                     ], 
                                 dim=1).long()  # B x (L_attack + L_output)
                                                # @ output positions, curr_toks is repeated B times.
@@ -153,13 +147,13 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                             labels=labels  # B x (L_attack + L_output) x d
                             )  # CausalLMOutputWithCrossAttentions object
             
-            # 1a. for ln p(o_>i|o<=i + x) OR ln p(o|x) loss
+            # 1a. for ln p(o>i|oi, o<i + x) OR ln p(o|x<i, xi, x>i) loss
             loss = log_prob_loss(out, labels, temp=1) * L_out  # scalar (averaged over B, summed over L_output --> MINE)
 
-            # 2a. for ln p(x_>i|x<=i) loss
+            # 2a. for ln p(x>i|xi, x<i) loss
             if args.lam_perp > 0:
                 perp_loss = log_perplexity(out, 
-                                           stacked_cur_toks[:, :output_start]  # B x (L_prefix + L_attack)
+                                           stacked_curr_toks[:, :output_start]  # B x (L_prefix + L_attack)
                                            ) * (L_prefix + L_attack - 1)  # scalar (averaged over B, summed over (L_prefix + L_attack - 1) --> MINE). ALSO INCLUDES PERPLEXITY OF PREFIX
                 loss += args.lam_perp * perp_loss
             
@@ -175,10 +169,10 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                                              grad[:, tok_idx, :].sum(dim=0)  # B x d => d
                                              )  # V scores, higher is better
 
-            # 1b. for ln p(o_i|o<i + x) term
+            # 1b. for ln p(oi|o<i + x) term
             if tok_in_output and not args.autoprompt:
                 forward_log_probs = F.log_softmax(out.logits[0, update_idx-1, :],  # B x (L_prefix + L_attack + L_output) x V => V
-                                                  dim=0)  # V, ln p(o_i|o<i + x)
+                                                  dim=0)  # V, ln p(oi|o<i + x)
                 scores = backward_scores + forward_log_probs  # V, higher is better
 
                 if args.unigram_output_constraint is not None:  # "toxic"
@@ -189,11 +183,11 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                 if args.unigram_input_constraint is not None:  # "not toxic"
                     scores += args.unigram_weight * input_unigram_lps  # V, higher is better
 
-            # 2b. for ln perp(x_i|x<i) term ???
+            # 2b. for ln perp(xi|x<i) term ???
             # ==================================== MINE ====================================
-            if tok_in_attack and (use_prefix or update_idx >= 1) and not args.autoprompt:
+            if (args.lam_perp > 0) and tok_in_attack and (use_prefix or update_idx >= 1) and not args.autoprompt:
                 forward_log_probs = F.log_softmax(out.logits[0, update_idx-1, :],  # B x (L_prefix + L_attack + L_output) x V => V
-                                                    dim=0)  # V, ln p(o_i|o<i + x)
+                                                    dim=0)  # V, ln p(oi|o<i + x)
                 scores += args.lam_perp * forward_log_probs  # V, higher is better
             # ==============================================================================
 
@@ -209,13 +203,11 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
             # Calculate actual losses ?
             with torch.no_grad():
                 top_B_toks = best_scores_idxs[:args.batch_size]  # B
-
                 full_embeddings[:, tok_idx, :] = embedding_table[top_B_toks, :]  # B x d
-                stacked_cur_toks[:, update_idx] = top_B_toks.cpu().detach().numpy()  # B
                 # MINE
-                curr_toks_tensor[:, update_idx] = top_B_toks  # B
+                stacked_curr_toks[:, update_idx] = top_B_toks  # B
                 # # THEIRS
-                # curr_toks_tensor[:, tok_idx] = top_B_toks
+                # stacked_curr_toks[:, tok_idx] = top_B_toks
                 
                 if use_prefix:
                     out = model(inputs_embeds=torch.cat([prefix_embeddings, 
@@ -230,12 +222,12 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                 log_probs = F.log_softmax(out.logits[:, (-1-L_out):-1, :],  # B x L_output x V
                                           dim=2)
                 batch_log_probs = torch.stack(
-                                        [log_probs[i, torch.arange(L_out), curr_toks_tensor[i,output_start:]].sum()  # scalar, summed over L_output
+                                        [log_probs[i, torch.arange(L_out), stacked_curr_toks[i,output_start:]].sum()  # scalar, summed over L_output
                                             for i in range(args.batch_size)])  # B
                 # 2. exact ln p(x_>=1|prefix) or ln p(x_>1|x_1)
                 if args.lam_perp > 0:
                     output_perps = log_perplexity(out, 
-                                                  stacked_cur_toks[:, :output_start],  # B x (L_prefix + L_attack)
+                                                  stacked_curr_toks[:, :output_start],  # B x (L_prefix + L_attack)
                                                   ret_all=True) * (L_prefix + L_attack - 1)  # B, summed over (L_prefix + L_attack-1) --> MINE
                     batch_log_probs -= args.lam_perp * output_perps
                 
@@ -246,13 +238,14 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                     batch_log_probs += args.unigram_weight * input_unigram_lps[top_B_toks]  # B
 
                 best_batch_idx = batch_log_probs.argmax()
-                best_idx = best_scores_idxs[best_batch_idx]  # best replacement token
+                best_idx = top_B_toks[best_batch_idx]  # best replacement token
+
+                assert best_idx == best_scores_idxs[best_batch_idx]
                 
                 curr_toks[update_idx] = best_idx.item()  # replace with best token
-                stacked_cur_toks[:, update_idx] = best_idx.item()
-                curr_toks_tensor[:, update_idx] = best_idx.item()
+                stacked_curr_toks[:, update_idx] = best_idx.item()
                 full_embeddings[:, tok_idx, :] = embedding_table[best_idx].unsqueeze(0).repeat(args.batch_size, 1)  # B x d
-                optimized_output = curr_toks_tensor[0][output_start:]  # L_output
+                optimized_output = stacked_curr_toks[0][output_start:]  # L_output
 
                 greedy_output = log_probs[best_batch_idx].argmax(dim=1)  # L_output
 
@@ -286,7 +279,7 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                         curr_toks = curr_toks[:-args.output_length]
 
                     prompt = tokenizer.decode(curr_toks)
-                    print(f"Found attack: {prompt}")
+                    print(f"Found string: {prompt}")
                     return curr_toks, it, run_metadata
                 
     # (Failure case)
@@ -301,6 +294,6 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
         curr_toks = curr_toks[:-args.output_length]
 
     prompt = tokenizer.decode(curr_toks)
-    print(f"Failed to find an attack: {prompt}")
+    print(f"Failed to find a string: {prompt}")
 
     return -1, -1, run_metadata

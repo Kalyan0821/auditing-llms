@@ -1,6 +1,6 @@
 import argparse
 
-def parse_args(joint = False):
+def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--save_every', type = int, default = 5,
@@ -42,7 +42,8 @@ def parse_args(joint = False):
             help = 'Prefix to include before the prompt for optimization')
     parser.add_argument('--output_length', type = int, default = 2,
             help = 'Size of the oiutput target')
-
+    parser.add_argument('--pair_type', type = str, default = None,
+            help = 'Either prompt_longer, output_longer, or same_length')
 
 
     parser.add_argument('--unigram_input_constraint', type = str, default = None,
@@ -57,8 +58,6 @@ def parse_args(joint = False):
             help = 'Number of gradient steps to take for the gbda attack')
     parser.add_argument('--gbda_learning_rate', type = float, default = 1e-1,
             help = 'Learning rate to use for the gbda attack')
-    parser.add_argument('--pair_type', type = str, default = None,
-            help = 'Either prompt_longer, output_longer, or same_length')
     
     args = parser.parse_args()
     

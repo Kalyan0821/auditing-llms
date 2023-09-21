@@ -91,6 +91,7 @@ def run_opts(args, model, tokenizer,
     all_dicts = [vars(args)] + results_dicts
     to_jsonl(all_dicts, output_filename)
 
+
 if __name__ == '__main__':
     args = parse_args()
     model, tokenizer = get_model_and_tokenizer(args)

@@ -49,7 +49,7 @@ def to_jsonl(dicts, save_file):
         os.makedirs(os.path.dirname(save_file))
     with open(save_file, 'w') as f:
         for line_dict in dicts:
-            print(line_dict)
+            # print(line_dict)
             jsonl_line = f'{json.dumps(line_dict, cls = NpEncoder)}\n'
             f.write(jsonl_line)
 
@@ -103,7 +103,7 @@ def toks_to_skip(output_toks,
         if (len(tok) <= 3) and (tok not in output_tok_strs):  # small tokens that are not in o are allowed in x
             continue
 
-        # (token is fair-game to elimate)
+        # (token is fair-game to eliminate)
         # look at (large tokens in o)/(large tokens not in o)/(small tokens in o)
         for otok in output_tok_strs:
             otok = otok.strip(' ').lower()
