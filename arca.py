@@ -183,7 +183,7 @@ def run_arca(args, model, tokenizer, embedding_table, output_str=None):
                 if args.unigram_input_constraint is not None:  # "not toxic"
                     scores += args.unigram_weight * input_unigram_lps  # V, higher is better
 
-            # 2b. for ln perp(xi|x<i) term ???
+            # 2b. for ln p(xi|x<i) term ???
             # ==================================== MINE ====================================
             if (args.lam_perp > 0) and tok_in_attack and (use_prefix or update_idx >= 1) and not args.autoprompt:
                 forward_log_probs = F.log_softmax(out.logits[0, update_idx-1, :],  # B x (L_prefix + L_attack + L_output) x V => V
